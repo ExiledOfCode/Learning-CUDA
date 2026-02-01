@@ -1,0 +1,20 @@
+{
+    "chat.agent.enabled": false,
+    "cmake.sourceDirectory": "D:/Project_Repository/CMU-15-445",
+    "files.associations": {
+        "*.cu": "cuda-cpp",
+        "*.cuh": "cuda-cpp",
+        "cuda.h": "cuda-cpp",
+        "cuda_runtime.h": "cuda-cpp",
+        "cuda_runtime_api.h": "cuda-cpp",
+        "device_launch_parameters.h": "cuda-cpp",
+        "vector_types.h": "cuda-cpp",
+        "__target_macros": "cpp",
+        "new": "cpp"
+    },
+    "C_Cpp.default.compilerPath": "D:/Application/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe",
+    "C_Cpp.intelliSenseEngine": "default",
+    "C_Cpp.autocomplete": "default",
+    "C_Cpp.formatting": "clangFormat",
+    "C_Cpp.clang_format_style": "file",
+}

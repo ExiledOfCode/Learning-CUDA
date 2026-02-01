@@ -17,10 +17,72 @@
  * @param cols Number of columns in the matrix.
  * @return The trace (sum of diagonal values) of the matrix.
  */
+
+template <typename T>
+__global__ void trace_reduce_kernel(const T* input, T* output,
+                                    size_t rows, size_t cols, size_t diag_len) {
+    // 静态 shared memory（避免 extern __shared__ 坑）
+    __shared__ T shm[256];
+
+    size_t tid = threadIdx.x;
+    size_t idx = blockIdx.x * blockDim.x + tid;
+
+    T local_sum = T(0);
+
+    // grid-stride 遍历对角线
+    for (size_t i = idx; i < diag_len; i += blockDim.x * gridDim.x) {
+        local_sum += input[i * cols + i];
+    }
+
+    shm[tid] = local_sum;
+    __syncthreads();
+
+    // block 内 reduce
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shm[tid] += shm[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(output, shm[0]);
+    }
+}
+
+
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+    size_t diag_len = std::min(rows, cols);
+
+    T* d_input = nullptr;
+    T* d_output = nullptr;
+
+    size_t input_bytes = h_input.size() * sizeof(T);
+
+    cudaMalloc(&d_input, input_bytes);
+    cudaMalloc(&d_output, sizeof(T));
+
+    cudaMemcpy(d_input, h_input.data(), input_bytes, cudaMemcpyHostToDevice);
+    cudaMemset(d_output, 0, sizeof(T));
+
+    int threads = 256;
+    int blocks = std::min(
+        (diag_len + threads - 1) / threads,
+        1024UL
+    );
+
+    trace_reduce_kernel<<<blocks, threads>>>(
+        d_input, d_output, rows, cols, diag_len
+    );
+
+    T h_output;
+    cudaMemcpy(&h_output, d_output, sizeof(T), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_input);
+    cudaFree(d_output);
+
+    return h_output;
 }
 
 /**
@@ -39,12 +101,115 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[in] head_dim Dimension size of each attention head
  * @param[in] is_causal Whether to apply causal masking
  */
+ template <typename T>
+__global__ void flash_attention_kernel(
+    const T* Q, const T* K, const T* V, T* O,
+    int B, int Tq, int Tk,
+    int QH, int KVH, int D,
+    bool causal
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * Tq * QH * D;
+    if (idx >= total) return;
+
+    int d = idx % D;
+    int qh = (idx / D) % QH;
+    int t = (idx / (D * QH)) % Tq;
+    int b = idx / (D * QH * Tq);
+
+    int kvh = qh * KVH / QH;
+
+    float max_score = -1e32f;
+
+    for (int s = 0; s < Tk; ++s) {
+        if (causal && s > t) continue;
+
+        float score = 0.f;
+        for (int i = 0; i < D; ++i) {
+            int q_idx = ((b * Tq + t) * QH + qh) * D + i;
+            int k_idx = ((b * Tk + s) * KVH + kvh) * D + i;
+            score += float(Q[q_idx]) * float(K[k_idx]);
+        }
+        score /= sqrtf(float(D));
+        max_score = fmaxf(max_score, score);
+    }
+
+    float denom = 0.f;
+    for (int s = 0; s < Tk; ++s) {
+        if (causal && s > t) continue;
+
+        float score = 0.f;
+        for (int i = 0; i < D; ++i) {
+            int q_idx = ((b * Tq + t) * QH + qh) * D + i;
+            int k_idx = ((b * Tk + s) * KVH + kvh) * D + i;
+            score += float(Q[q_idx]) * float(K[k_idx]);
+        }
+        score = expf(score / sqrtf(float(D)) - max_score);
+        denom += score;
+    }
+
+    float out = 0.f;
+    for (int s = 0; s < Tk; ++s) {
+        if (causal && s > t) continue;
+
+        float score = 0.f;
+        for (int i = 0; i < D; ++i) {
+            int q_idx = ((b * Tq + t) * QH + qh) * D + i;
+            int k_idx = ((b * Tk + s) * KVH + kvh) * D + i;
+            score += float(Q[q_idx]) * float(K[k_idx]);
+        }
+        score = expf(score / sqrtf(float(D)) - max_score) / denom;
+
+        int v_idx = ((b * Tk + s) * KVH + kvh) * D + d;
+        out += score * float(V[v_idx]);
+    }
+
+    int o_idx = ((b * Tq + t) * QH + qh) * D + d;
+    O[o_idx] = T(out);
+}
+
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+
+    size_t q_bytes = h_q.size() * sizeof(T);
+    size_t k_bytes = h_k.size() * sizeof(T);
+    size_t v_bytes = h_v.size() * sizeof(T);
+    size_t o_bytes = h_o.size() * sizeof(T);
+
+    T *d_q, *d_k, *d_v, *d_o;
+    cudaMalloc(&d_q, q_bytes);
+    cudaMalloc(&d_k, k_bytes);
+    cudaMalloc(&d_v, v_bytes);
+    cudaMalloc(&d_o, o_bytes);
+
+    cudaMemcpy(d_q, h_q.data(), q_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, h_k.data(), k_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, h_v.data(), v_bytes, cudaMemcpyHostToDevice);
+
+    int total = batch_size * target_seq_len * query_heads * head_dim;
+    int threads = 128;
+    int blocks = (total + threads - 1) / threads;
+
+    flash_attention_kernel<<<blocks, threads>>>(
+        d_q, d_k, d_v, d_o,
+        batch_size,
+        target_seq_len,
+        src_seq_len,
+        query_heads,
+        kv_heads,
+        head_dim,
+        is_causal
+    );
+
+    cudaMemcpy(h_o.data(), d_o, o_bytes, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_o);
 }
 
 // *********************************************************************

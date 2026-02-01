@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "CUDA Debug",
+            "type": "cudagdb",
+            "request": "launch",
+            "program": "${workspaceFolder}/bin/${fileBasenameNoExtension}.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                {
+                    "name": "PATH",
+                    "value": "${env:PATH};C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin"
+                }
+            ],
+            "console": "externalTerminal"
+        }
+    ]
+}
