@@ -21,7 +21,6 @@
 template <typename T>
 __global__ void trace_reduce_kernel(const T* input, T* output,
                                     size_t rows, size_t cols, size_t diag_len) {
-    // 静态 shared memory（避免 extern __shared__ 坑）
     __shared__ T shm[256];
 
     size_t tid = threadIdx.x;
@@ -29,15 +28,13 @@ __global__ void trace_reduce_kernel(const T* input, T* output,
 
     T local_sum = T(0);
 
-    // grid-stride 遍历对角线
     for (size_t i = idx; i < diag_len; i += blockDim.x * gridDim.x) {
         local_sum += input[i * cols + i];
     }
 
     shm[tid] = local_sum;
     __syncthreads();
-
-    // block 内 reduce
+    
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
             shm[tid] += shm[tid + s];
@@ -101,7 +98,10 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[in] head_dim Dimension size of each attention head
  * @param[in] is_causal Whether to apply causal masking
  */
- template <typename T>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math_constants.h>
+template <typename T>
 __global__ void flash_attention_kernel(
     const T* Q, const T* K, const T* V, T* O,
     int B, int Tq, int Tk,
@@ -112,60 +112,55 @@ __global__ void flash_attention_kernel(
     int total = B * Tq * QH * D;
     if (idx >= total) return;
 
-    int d = idx % D;
+    int d  = idx % D;
     int qh = (idx / D) % QH;
-    int t = (idx / (D * QH)) % Tq;
-    int b = idx / (D * QH * Tq);
+    int t  = (idx / (D * QH)) % Tq;
+    int b  = idx / (D * QH * Tq);
 
     int kvh = qh * KVH / QH;
 
-    float max_score = -1e32f;
+    const float scale = rsqrtf((float)D);
+
+    float max_score = -CUDART_INF_F;
 
     for (int s = 0; s < Tk; ++s) {
         if (causal && s > t) continue;
 
-        float score = 0.f;
-        for (int i = 0; i < D; ++i) {
-            int q_idx = ((b * Tq + t) * QH + qh) * D + i;
-            int k_idx = ((b * Tk + s) * KVH + kvh) * D + i;
-            score += float(Q[q_idx]) * float(K[k_idx]);
-        }
-        score /= sqrtf(float(D));
-        max_score = fmaxf(max_score, score);
+        float dot = 0.f;
+        int q_base = ((b * Tq + t) * QH + qh) * D;
+        int k_base = ((b * Tk + s) * KVH + kvh) * D;
+
+        #pragma unroll
+        for (int i = 0; i < D; ++i)
+            dot += float(Q[q_base + i]) * float(K[k_base + i]);
+
+        dot *= scale;
+        max_score = fmaxf(max_score, dot);
     }
 
     float denom = 0.f;
+    float out   = 0.f;
+
     for (int s = 0; s < Tk; ++s) {
         if (causal && s > t) continue;
 
-        float score = 0.f;
-        for (int i = 0; i < D; ++i) {
-            int q_idx = ((b * Tq + t) * QH + qh) * D + i;
-            int k_idx = ((b * Tk + s) * KVH + kvh) * D + i;
-            score += float(Q[q_idx]) * float(K[k_idx]);
-        }
-        score = expf(score / sqrtf(float(D)) - max_score);
-        denom += score;
-    }
+        float dot = 0.f;
+        int q_base = ((b * Tq + t) * QH + qh) * D;
+        int k_base = ((b * Tk + s) * KVH + kvh) * D;
 
-    float out = 0.f;
-    for (int s = 0; s < Tk; ++s) {
-        if (causal && s > t) continue;
+        #pragma unroll
+        for (int i = 0; i < D; ++i)
+            dot += float(Q[q_base + i]) * float(K[k_base + i]);
 
-        float score = 0.f;
-        for (int i = 0; i < D; ++i) {
-            int q_idx = ((b * Tq + t) * QH + qh) * D + i;
-            int k_idx = ((b * Tk + s) * KVH + kvh) * D + i;
-            score += float(Q[q_idx]) * float(K[k_idx]);
-        }
-        score = expf(score / sqrtf(float(D)) - max_score) / denom;
+        float p = __expf(dot * scale - max_score);
+        denom += p;
 
         int v_idx = ((b * Tk + s) * KVH + kvh) * D + d;
-        out += score * float(V[v_idx]);
+        out += p * float(V[v_idx]);
     }
 
     int o_idx = ((b * Tq + t) * QH + qh) * D + d;
-    O[o_idx] = T(out);
+    O[o_idx] = (T)(out / denom);
 }
 
 template <typename T>
