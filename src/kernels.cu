@@ -1,5 +1,10 @@
 #include <vector>
 #include <cuda_fp16.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math_constants.h>
+#include <vector>
 
 #include "../tester/utils.h"
 
@@ -98,9 +103,27 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[in] head_dim Dimension size of each attention head
  * @param[in] is_causal Whether to apply causal masking
  */
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <math_constants.h>
+
+template <typename T>
+__device__ __forceinline__ float to_float(T x) {
+    return (float)x;
+}
+template <>
+__device__ __forceinline__ float to_float<half>(half x) {
+    return __half2float(x);
+}
+
+template <typename T>
+__device__ __forceinline__ T from_float(float x);
+template <>
+__device__ __forceinline__ float from_float<float>(float x) {
+    return x;
+}
+template <>
+__device__ __forceinline__ half from_float<half>(float x) {
+    return __float2half(x);
+}
+
 template <typename T>
 __global__ void flash_attention_kernel(
     const T* Q, const T* K, const T* V, T* O,
@@ -108,66 +131,70 @@ __global__ void flash_attention_kernel(
     int QH, int KVH, int D,
     bool causal
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = B * Tq * QH * D;
-    if (idx >= total) return;
-
-    int d  = idx % D;
-    int qh = (idx / D) % QH;
-    int t  = (idx / (D * QH)) % Tq;
-    int b  = idx / (D * QH * Tq);
+    int b  = blockIdx.x;
+    int t  = blockIdx.y;
+    int qh = blockIdx.z;
+    int tid = threadIdx.x;
 
     int kvh = qh * KVH / QH;
+    float scale = rsqrtf((float)D);
 
-    const float scale = rsqrtf((float)D);
+    extern __shared__ float smem[];
+    float* Qs = smem;
+    float* Ks = smem + D;
+    float* Os = smem + 2 * D;
 
-    float max_score = -CUDART_INF_F;
+    for (int d = tid; d < D; d += blockDim.x) {
+        int q_idx = ((b * Tq + t) * QH + qh) * D + d;
+        Qs[d] = to_float(Q[q_idx]);
+        Os[d] = 0.f;
+    }
+    __syncthreads();
+
+    float m = -CUDART_INF_F;
+    float l = 0.f;
 
     for (int s = 0; s < Tk; ++s) {
-        if (causal && s > t) continue;
+        if (causal && s > t) break;
+
+        for (int d = tid; d < D; d += blockDim.x) {
+            int k_idx = ((b * Tk + s) * KVH + kvh) * D + d;
+            Ks[d] = to_float(K[k_idx]);
+        }
+        __syncthreads();
 
         float dot = 0.f;
-        int q_base = ((b * Tq + t) * QH + qh) * D;
-        int k_base = ((b * Tk + s) * KVH + kvh) * D;
-
-        #pragma unroll
         for (int i = 0; i < D; ++i)
-            dot += float(Q[q_base + i]) * float(K[k_base + i]);
-
+            dot += Qs[i] * Ks[i];
         dot *= scale;
-        max_score = fmaxf(max_score, dot);
+
+        float m_new = fmaxf(m, dot);
+        float alpha = __expf(m - m_new);
+        float beta  = __expf(dot - m_new);
+
+        for (int d = tid; d < D; d += blockDim.x) {
+            int v_idx = ((b * Tk + s) * KVH + kvh) * D + d;
+            float v = to_float(V[v_idx]);
+            Os[d] = Os[d] * alpha + beta * v;
+        }
+
+        l = l * alpha + beta;
+        m = m_new;
+        __syncthreads();
     }
 
-    float denom = 0.f;
-    float out   = 0.f;
-
-    for (int s = 0; s < Tk; ++s) {
-        if (causal && s > t) continue;
-
-        float dot = 0.f;
-        int q_base = ((b * Tq + t) * QH + qh) * D;
-        int k_base = ((b * Tk + s) * KVH + kvh) * D;
-
-        #pragma unroll
-        for (int i = 0; i < D; ++i)
-            dot += float(Q[q_base + i]) * float(K[k_base + i]);
-
-        float p = __expf(dot * scale - max_score);
-        denom += p;
-
-        int v_idx = ((b * Tk + s) * KVH + kvh) * D + d;
-        out += p * float(V[v_idx]);
+    // write output
+    for (int d = tid; d < D; d += blockDim.x) {
+        int o_idx = ((b * Tq + t) * QH + qh) * D + d;
+        O[o_idx] = from_float<T>(Os[d] / l);
     }
-
-    int o_idx = ((b * Tq + t) * QH + qh) * D + d;
-    O[o_idx] = (T)(out / denom);
 }
 
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
 
     size_t q_bytes = h_q.size() * sizeof(T);
     size_t k_bytes = h_k.size() * sizeof(T);
@@ -184,11 +211,13 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     cudaMemcpy(d_k, h_k.data(), k_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(d_v, h_v.data(), v_bytes, cudaMemcpyHostToDevice);
 
-    int total = batch_size * target_seq_len * query_heads * head_dim;
-    int threads = 128;
-    int blocks = (total + threads - 1) / threads;
+    dim3 grid(batch_size, target_seq_len, query_heads);
+    int threads = 256;
+    dim3 block(threads);
 
-    flash_attention_kernel<<<blocks, threads>>>(
+    size_t smem = 3 * head_dim * sizeof(float);
+
+    flash_attention_kernel<T><<<grid, block, smem>>>(
         d_q, d_k, d_v, d_o,
         batch_size,
         target_seq_len,
